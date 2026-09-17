@@ -67,12 +67,15 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <vector>
+
+#include <pthread.h>
 
 // Authoritative IRQ-entry counter, incremented in runtime_irq (runtime_arm.cpp)
 // at the actual vectoring site. The TCP `counters` command surfaces it via
@@ -1115,6 +1118,61 @@ std::size_t count_nonzero(const uint8_t* p, std::size_t n) {
     }
     return c;
 }
+
+// A `std::thread` whose stack is sized like Linux's default rather than the
+// host's — the game thread runs it. `runtime_dispatch` recurses one native
+// C-stack frame per backward branch a recompiled function takes (an
+// interrupt-wait spin, a decompression inner loop), which a several-MB
+// Linux thread stack usually absorbs. macOS's `libpthread` defaults a
+// secondary thread — anything but the main one — to 512 KiB regardless of
+// the process's own `ulimit -s`, which is why this is a stack overflow
+// (`SIGBUS` from the guard page) seen only there: the same recompiled loop
+// that runs fine on the platform this project verifies against exhausts an
+// eighth of its stack budget here. `std::thread` has no portable stack-size
+// knob, so this goes to `pthread_create` directly for the one thread that
+// needs it, behind the same `joinable()`/`join()` surface the call site
+// already uses.
+class GameThread {
+public:
+    template <typename F>
+    explicit GameThread(F&& body) {
+        auto* fn = new std::function<void()>(std::forward<F>(body));
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr, 8u * 1024u * 1024u);
+        const int rc = pthread_create(&handle_, &attr, &GameThread::trampoline, fn);
+        pthread_attr_destroy(&attr);
+        if (rc != 0) {
+            delete fn;
+            std::fprintf(stderr, "[gbarecomp:runtime] pthread_create failed for the "
+                                  "game thread (errno %d)\n", rc);
+            std::abort();
+        }
+        started_ = true;
+    }
+    GameThread(const GameThread&) = delete;
+    GameThread& operator=(const GameThread&) = delete;
+    ~GameThread() { if (started_) pthread_detach(handle_); }
+
+    bool joinable() const { return started_; }
+    void join() {
+        if (started_) {
+            pthread_join(handle_, nullptr);
+            started_ = false;
+        }
+    }
+
+private:
+    static void* trampoline(void* arg) {
+        std::unique_ptr<std::function<void()>> fn(
+            static_cast<std::function<void()>*>(arg));
+        (*fn)();
+        return nullptr;
+    }
+
+    pthread_t handle_{};
+    bool      started_ = false;
+};
 
 }  // namespace
 
@@ -2165,7 +2223,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         bool ctl_step_done = false;
         bool ctl_step_ok   = true;
 
-        std::thread game_thread([&]() {
+        GameThread game_thread([&]() {
             for (;;) {
                 int st;
                 {

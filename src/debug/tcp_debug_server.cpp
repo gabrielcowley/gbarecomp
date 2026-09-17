@@ -803,6 +803,16 @@ void dispatch(const TcpDebugServer::Context& ctx, std::string_view req,
         cmd_read_region(ctx.bus->ewram_ptr(), 256 * 1024, req, out, 0x02000000u);
         return;
     }
+    if (contains("\"read_rom\"")) {
+        if (!ctx.bus) { emit_error(out, "bus unavailable"); return; }
+        if (!ctx.bus->rom_ptr() || ctx.bus->rom_size() == 0) {
+            emit_error(out, "no ROM loaded");
+            return;
+        }
+        cmd_read_region(ctx.bus->rom_ptr(), ctx.bus->rom_size(), req, out,
+                        0x08000000u);
+        return;
+    }
     if (contains("\"read_io\"")) {
         if (!ctx.bus) { emit_error(out, "bus unavailable"); return; }
         cmd_read_io_dynamic(*ctx.bus, req, out);
